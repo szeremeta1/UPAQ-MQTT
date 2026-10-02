@@ -24,6 +24,7 @@ polling interval; PUBLISH_INTERVAL optionally rate-limits routine reading update
 import base64
 import http.cookiejar
 import json
+import math
 import os
 import ssl
 import struct
@@ -506,9 +507,21 @@ def _is_urgent(last, payload):
     return not last.get("vape") and bool(payload.get("vape"))
 
 
-def _flush_state(client, sensor_ctx):
+def _cancel_pending(sensor_ctx):
+    """Drop a sensor's pending flush. Call with the sensor lock held."""
+    pending = sensor_ctx.pop("timer", None)
+    if pending:
+        pending[0].cancel()
+
+
+def _flush_state(client, sensor_ctx, token):
     with sensor_lock(sensor_ctx):
-        sensor_ctx.pop("timer", None)
+        pending = sensor_ctx.get("timer")
+        if not pending or pending[1] is not token:
+            # Cancelled or superseded while this thread waited for the lock
+            # (Timer.cancel() can't stop a callback that has already started).
+            return
+        del sensor_ctx["timer"]
         payload = state_payload(sensor_ctx["device"])
         if payload != sensor_ctx.get("last_payload"):
             _publish_payload(client, sensor_ctx, payload)
@@ -526,25 +539,22 @@ def publish_state(client, sensor_ctx, interval=0):
         last = sensor_ctx.get("last_payload")
         wait = interval - (time.monotonic() - sensor_ctx.get("last_publish", 0.0))
         if interval <= 0 or wait <= 0 or _is_urgent(last, payload):
-            timer = sensor_ctx.pop("timer", None)
-            if timer:
-                timer.cancel()
+            _cancel_pending(sensor_ctx)
             _publish_payload(client, sensor_ctx, payload)
             return
         if payload == last or sensor_ctx.get("timer"):
             return  # unchanged, or a pending flush will send the latest values
-        timer = threading.Timer(wait, _flush_state, (client, sensor_ctx))
+        token = object()
+        timer = threading.Timer(wait, _flush_state, (client, sensor_ctx, token))
         timer.daemon = True
-        sensor_ctx["timer"] = timer
+        sensor_ctx["timer"] = (timer, token)
         timer.start()
 
 
 def cancel_pending_publishes(sensor_contexts):
     for sensor_ctx in sensor_contexts:
         with sensor_lock(sensor_ctx):
-            timer = sensor_ctx.pop("timer", None)
-            if timer:
-                timer.cancel()
+            _cancel_pending(sensor_ctx)
 
 
 def command_subscriptions(sensor_contexts):
@@ -571,8 +581,8 @@ def main():
         publish_interval = float(env("PUBLISH_INTERVAL", "0") or 0)
     except ValueError:
         sys.exit("PUBLISH_INTERVAL must be a number of seconds")
-    if publish_interval < 0:
-        sys.exit("PUBLISH_INTERVAL must not be negative")
+    if not math.isfinite(publish_interval) or not 0 <= publish_interval <= threading.TIMEOUT_MAX:
+        sys.exit(f"PUBLISH_INTERVAL must be between 0 and {threading.TIMEOUT_MAX:g} seconds")
 
     # Callback threads grab one complete snapshot so reconnects cannot expose
     # mixed old/new token and sensor maps.
@@ -763,16 +773,20 @@ def main():
                 if not sensor_ctx:
                     return
                 device = sensor_ctx["device"]
-                if "airQuality" in delta:
-                    with sensor_lock(sensor_ctx):
-                        deep_merge(device, delta)
-                    publish_state(client, sensor_ctx, publish_interval)
-                if "airQualitySettings" in delta or "ledSettings" in delta:
-                    deep_merge(device, delta)  # changed elsewhere (app)
-                    publish_control_state(client, sensor_ctx["topics"], device)
-                if any(k in delta for k in ("firmwareVersion", "fwUpdateState",
-                                            "latestFirmwareVersion")):
+                readings = "airQuality" in delta
+                settings = "airQualitySettings" in delta or "ledSettings" in delta
+                firmware = any(k in delta for k in ("firmwareVersion", "fwUpdateState",
+                                                    "latestFirmwareVersion"))
+                if not (readings or settings or firmware):
+                    return
+                # Merge once, under the lock the flush timer holds while it reads.
+                with sensor_lock(sensor_ctx):
                     deep_merge(device, delta)
+                if readings:
+                    publish_state(client, sensor_ctx, publish_interval)
+                if settings:  # changed elsewhere (app)
+                    publish_control_state(client, sensor_ctx["topics"], device)
+                if firmware:
                     publish_diag_state(client, sensor_ctx["topics"], device)
 
             def on_open(ws):
