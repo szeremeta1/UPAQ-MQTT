@@ -498,11 +498,12 @@ def _publish_payload(client, sensor_ctx, payload):
 
 
 def _is_urgent(last, payload):
-    """Changes worth sending at once: any *_status level, or the vape reading."""
+    """Changes worth sending at once: any *_status level, or vape going from 0 to detected."""
     if last is None:
         return True
-    return any(last.get(k) != v for k, v in payload.items()
-               if k.endswith("_status") or k == "vape")
+    if any(last.get(k) != v for k, v in payload.items() if k.endswith("_status")):
+        return True
+    return not last.get("vape") and bool(payload.get("vape"))
 
 
 def _flush_state(client, sensor_ctx):
@@ -517,8 +518,8 @@ def publish_state(client, sensor_ctx, interval=0):
     """Publish a sensor's readings.
 
     With interval > 0, routine value changes are sent at most once per interval
-    (the latest values go out when it elapses); status changes and vape readings
-    are still sent immediately.
+    (the latest values go out when it elapses); status changes and a new vape
+    detection are still sent immediately.
     """
     with sensor_lock(sensor_ctx):
         payload = state_payload(sensor_ctx["device"])

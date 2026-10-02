@@ -71,7 +71,7 @@ All config is via environment variables (`.env`):
 | `MQTT_USER` | no | — | Broker username (omit for anonymous) |
 | `MQTT_PASS` | no | — | Broker password |
 | `DISCOVERY_PREFIX` | no | `homeassistant` | HA discovery prefix |
-| `PUBLISH_INTERVAL` | no | `0` | Seconds between routine reading updates (`0` = publish every change). Status-level changes and vape readings are always sent immediately |
+| `PUBLISH_INTERVAL` | no | `0` | Seconds between routine reading updates (`0` = publish every change). Status-level changes and a new vape detection are always sent immediately |
 
 ## How it works
 
