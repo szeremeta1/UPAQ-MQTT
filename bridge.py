@@ -31,6 +31,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import zlib
 
@@ -178,8 +179,8 @@ def _csrf_from_token(token):
         return None
 
 
-def login_and_bootstrap(host, user, pw):
-    """Return (token_cookie_value, csrf_token, bootstrap_dict)."""
+def login(host, user, pw):
+    """Log in; return (token_cookie_value, csrf_token, opener)."""
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(
         urllib.request.HTTPSHandler(context=_ctx()),
@@ -201,7 +202,12 @@ def login_and_bootstrap(host, user, pw):
         sys.exit("Login succeeded but no TOKEN cookie returned")
     if not csrf:
         csrf = _csrf_from_token(token)  # fall back to the JWT payload
+    return token, csrf, opener
 
+
+def login_and_bootstrap(host, user, pw):
+    """Return (token_cookie_value, csrf_token, bootstrap_dict)."""
+    token, csrf, opener = login(host, user, pw)
     req = urllib.request.Request(
         f"https://{host}/proxy/protect/api/bootstrap",
         headers={"Accept": "application/json"},
@@ -589,6 +595,24 @@ def main():
     ctx = {"snapshot": {"host": host, "token": None, "csrf": None,
                         "sensors_by_id": {}, "sensors_by_mac": {}}}
 
+    def send_patch(sensor_id, body):
+        """PATCH with the current session. The login token expires after a while
+        (UniFi OS: about 2 h) while the updates WebSocket stays up, so every command
+        then failed with HTTP 401 until the next reconnect. On 401: log in again
+        once, keep the new token for later commands, retry."""
+        snapshot = ctx["snapshot"]
+        try:
+            patch_sensor(snapshot["host"], snapshot["token"], snapshot["csrf"],
+                         sensor_id, body)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+        token, csrf, _ = login(host, user, pw)
+        ctx["snapshot"] = {**ctx["snapshot"], "token": token, "csrf": csrf}
+        print("Command session expired; logged in again", flush=True)
+        patch_sensor(host, token, csrf, sensor_id, body)
+
     def on_mqtt_message(client, userdata, msg):
         parts = msg.topic.split("/")
         if len(parts) < 3 or parts[0] != "up_airquality":
@@ -604,9 +628,7 @@ def main():
         try:
             if msg.topic == topics["brightness_cmd"]:
                 val = max(0, min(100, int(float(payload))))
-                patch_sensor(snapshot["host"], snapshot["token"], snapshot["csrf"],
-                             sensor_id, {"airQualitySettings":
-                                         {"ringLedBrightness": val}})
+                send_patch(sensor_id, {"airQualitySettings": {"ringLedBrightness": val}})
                 device.setdefault("airQualitySettings", {})["ringLedBrightness"] = val
                 client.publish(topics["brightness_state"], val, qos=1, retain=True)
                 print(f"{sensor_ctx['mac']} LED brightness -> {val}", flush=True)
@@ -615,34 +637,27 @@ def main():
                     print(f"Ignoring unknown metric option: {payload}", flush=True)
                     return
                 val = LED_METRIC_OPTIONS[payload]
-                patch_sensor(snapshot["host"], snapshot["token"], snapshot["csrf"],
-                             sensor_id, {"airQualitySettings":
-                                         {"ringLedMetric": val}})
+                send_patch(sensor_id, {"airQualitySettings": {"ringLedMetric": val}})
                 device.setdefault("airQualitySettings", {})["ringLedMetric"] = val
                 client.publish(topics["metric_state"], payload, qos=1, retain=True)
                 print(f"{sensor_ctx['mac']} LED metric -> {payload} ({val})", flush=True)
             elif msg.topic == topics["status_cmd"]:
                 on = payload.upper() == "ON"
-                patch_sensor(snapshot["host"], snapshot["token"], snapshot["csrf"],
-                             sensor_id, {"ledSettings": {"isEnabled": on}})
+                send_patch(sensor_id, {"ledSettings": {"isEnabled": on}})
                 device.setdefault("ledSettings", {})["isEnabled"] = on
                 client.publish(topics["status_state"], payload.upper(),
                                qos=1, retain=True)
                 print(f"{sensor_ctx['mac']} Status light -> {payload.upper()}", flush=True)
             elif msg.topic == topics["night_cmd"]:
                 on = payload.upper() == "ON"
-                patch_sensor(snapshot["host"], snapshot["token"], snapshot["csrf"],
-                             sensor_id,
-                             {"airQualitySettings": {"nightModeEnabled": on}})
+                send_patch(sensor_id, {"airQualitySettings": {"nightModeEnabled": on}})
                 device.setdefault("airQualitySettings", {})["nightModeEnabled"] = on
                 client.publish(topics["night_state"], payload.upper(),
                                qos=1, retain=True)
                 print(f"{sensor_ctx['mac']} Night mode -> {payload.upper()}", flush=True)
             elif msg.topic == topics["night_bri_cmd"]:
                 val = max(0, min(100, int(float(payload))))
-                patch_sensor(snapshot["host"], snapshot["token"], snapshot["csrf"],
-                             sensor_id,
-                             {"airQualitySettings": {"nightModeBrightness": val}})
+                send_patch(sensor_id, {"airQualitySettings": {"nightModeBrightness": val}})
                 device.setdefault("airQualitySettings", {})["nightModeBrightness"] = val
                 client.publish(topics["night_bri_state"], val, qos=1, retain=True)
                 print(f"{sensor_ctx['mac']} Night mode brightness -> {val}", flush=True)
@@ -654,9 +669,7 @@ def main():
                 fval = float(payload)
                 val = int(fval) if fval.is_integer() else fval
                 key = THRESHOLD_BOUNDS[bound]
-                patch_sensor(snapshot["host"], snapshot["token"], snapshot["csrf"],
-                             sensor_id,
-                             {"airQualitySettings": {f"{metric}Settings": {key: val}}})
+                send_patch(sensor_id, {"airQualitySettings": {f"{metric}Settings": {key: val}}})
                 aqs = device.setdefault("airQualitySettings", {})
                 aqs.setdefault(f"{metric}Settings", {})[key] = val
                 client.publish(f"{topics['base']}/thresh/{metric}/{bound}/state",
